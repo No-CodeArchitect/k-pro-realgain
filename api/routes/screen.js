@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import Anthropic from '@anthropic-ai/sdk';
-import { getPool } from '../lib/db.js';
+import { isMemoryMode, getPool, getMemoryCategories, addMemoryRecord } from '../lib/db.js';
 
 const router = Router();
 
@@ -21,19 +21,20 @@ router.post('/', async (req, res) => {
 
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) {
-    return res.status(500).json({ error: 'AI API 키가 설정되지 않았습니다. 서버 환경변수를 확인하세요.' });
+    return res.status(500).json({ error: 'AI API 키가 설정되지 않았습니다. Vercel 환경변수에 ANTHROPIC_API_KEY를 추가하세요.' });
   }
 
   try {
-    const pool = getPool();
-    const { rows: catRows } = await pool.query('SELECT * FROM product_categories ORDER BY id');
-    const categories = catRows.map(parseCategory);
+    let categories;
+    if (isMemoryMode()) {
+      categories = getMemoryCategories();
+    } else {
+      const { rows } = await getPool().query('SELECT * FROM product_categories ORDER BY id');
+      categories = rows.map(parseCategory);
+    }
 
     const categoryContext = categories.map(c =>
-      `[제품군: ${c.name}]\n` +
-      `- 대표 제품/스펙: ${c.specs}\n` +
-      `- 적용 이력: ${c.track_record.join(', ')}\n` +
-      `- 매칭 키워드: ${c.keywords.join(', ')}`
+      `[제품군: ${c.name}]\n- 대표 제품/스펙: ${c.specs}\n- 적용 이력: ${c.track_record.join(', ')}\n- 매칭 키워드: ${c.keywords.join(', ')}`
     ).join('\n\n');
 
     const systemPrompt = `당신은 ㈜리얼게인의 K-PRO 공고 스크리닝 AI 도우미입니다.
@@ -59,12 +60,7 @@ ${categoryContext}
   "confidence": "상 | 중 | 하"
 }`;
 
-    const userMessage = `[공고 정보]
-공고명: ${announcement_title}
-발주처: ${agency || '한국수력원자력'}
-
-[규격서 내용]
-${spec_text}`;
+    const userMessage = `[공고 정보]\n공고명: ${announcement_title}\n발주처: ${agency || '한국수력원자력'}\n\n[규격서 내용]\n${spec_text}`;
 
     const client = new Anthropic({ apiKey });
     const response = await client.messages.create({
@@ -75,17 +71,13 @@ ${spec_text}`;
     });
 
     const text = response.content[0].text.trim();
-
     let result;
     try {
       const jsonMatch = text.match(/\{[\s\S]*\}/);
       if (!jsonMatch) throw new Error('JSON not found');
       result = JSON.parse(jsonMatch[0]);
     } catch {
-      return res.status(422).json({
-        error: '판정 결과를 해석하지 못했습니다. 다시 시도해주세요.',
-        raw: text
-      });
+      return res.status(422).json({ error: '판정 결과를 해석하지 못했습니다. 다시 시도해주세요.', raw: text });
     }
 
     if (!['적합', '보류', '제외'].includes(result.verdict)) {
@@ -98,6 +90,20 @@ ${spec_text}`;
       if (cat) matchedCategoryId = cat.id;
     }
 
+    if (isMemoryMode()) {
+      const saved = addMemoryRecord({
+        announcement_title,
+        agency: agency || '한국수력원자력',
+        spec_text,
+        verdict: result.verdict,
+        reasoning: result.reasoning,
+        matched_category_id: matchedCategoryId,
+        confidence: result.confidence
+      });
+      return res.json(saved);
+    }
+
+    const pool = getPool();
     const inserted = await pool.query(
       `INSERT INTO screening_records (announcement_title, agency, spec_text, verdict, reasoning, matched_category_id, confidence)
        VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
@@ -105,18 +111,12 @@ ${spec_text}`;
     );
 
     const { rows: savedRows } = await pool.query(
-      `SELECT r.*, c.name as matched_category_name
-       FROM screening_records r
-       LEFT JOIN product_categories c ON r.matched_category_id = c.id
-       WHERE r.id = $1`,
+      `SELECT r.*, c.name as matched_category_name FROM screening_records r LEFT JOIN product_categories c ON r.matched_category_id = c.id WHERE r.id = $1`,
       [inserted.rows[0].id]
     );
-
     res.json(savedRows[0]);
   } catch (err) {
-    if (err.status === 401) {
-      return res.status(500).json({ error: 'AI API 키가 유효하지 않습니다.' });
-    }
+    if (err.status === 401) return res.status(500).json({ error: 'AI API 키가 유효하지 않습니다.' });
     console.error('AI 분석 오류:', err);
     res.status(500).json({ error: 'AI 분석 중 오류가 발생했습니다. 다시 시도해주세요.' });
   }
