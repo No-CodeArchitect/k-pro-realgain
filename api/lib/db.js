@@ -16,7 +16,7 @@ const seedData = [
 ];
 
 export async function initDb() {
-  const dbUrl = process.env.DATABASE_URL || process.env.POSTGRES_URL;
+  const dbUrl = process.env.DATABASE_URL || process.env.POSTGRES_URL || process.env.STORAGE_URL || process.env.POSTGRES_URL_NON_POOLING;
 
   if (!dbUrl) {
     useMemory = true;
