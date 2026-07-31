@@ -12,11 +12,20 @@ function parseCategory(r) {
   };
 }
 
-router.post('/', async (req, res) => {
-  const { announcement_title, agency, spec_text } = req.body;
+async function extractPdfText(base64Data) {
+  const pdfParse = (await import('pdf-parse/lib/pdf-parse.js')).default;
+  const buffer = Buffer.from(base64Data, 'base64');
+  const result = await pdfParse(buffer);
+  return result.text;
+}
 
-  if (!announcement_title || !spec_text) {
-    return res.status(400).json({ error: '공고명과 규격서 내용은 필수입니다.' });
+
+router.post('/', async (req, res) => {
+  const { announcement_title, agency, spec_text, attachments } = req.body;
+  const hasAttachments = attachments && attachments.length > 0;
+
+  if (!announcement_title || (!spec_text && !hasAttachments)) {
+    return res.status(400).json({ error: '공고명과 규격서 내용(또는 첨부파일)은 필수입니다.' });
   }
 
   const apiKey = process.env.ANTHROPIC_API_KEY;
@@ -60,14 +69,43 @@ ${categoryContext}
   "confidence": "상 | 중 | 하"
 }`;
 
-    const userMessage = `[공고 정보]\n공고명: ${announcement_title}\n발주처: ${agency || '한국수력원자력'}\n\n[규격서 내용]\n${spec_text}`;
+    let attachmentTextParts = [];
+    let imageBlocks = [];
+
+    if (hasAttachments) {
+      for (const att of attachments) {
+        if (att.type === 'application/pdf') {
+          try {
+            const text = await extractPdfText(att.data);
+            attachmentTextParts.push(`[첨부 PDF: ${att.name}]\n${text}`);
+          } catch (e) {
+            attachmentTextParts.push(`[첨부 PDF: ${att.name}] (텍스트 추출 실패)`);
+          }
+        } else if (att.type.startsWith('image/')) {
+          const mediaType = att.type === 'image/jpg' ? 'image/jpeg' : att.type;
+          imageBlocks.push({
+            type: 'image',
+            source: { type: 'base64', media_type: mediaType, data: att.data }
+          });
+        }
+      }
+    }
+
+    const textContent = [`[공고 정보]\n공고명: ${announcement_title}\n발주처: ${agency || '한국수력원자력'}`];
+    if (spec_text) textContent.push(`[규격서 내용]\n${spec_text}`);
+    if (attachmentTextParts.length > 0) textContent.push(`[첨부파일 내용]\n${attachmentTextParts.join('\n\n')}`);
+    if (imageBlocks.length > 0) textContent.push('[첨부 이미지는 아래에 포함되어 있습니다. 이미지의 내용을 읽고 규격서 정보를 파악하세요.]');
+
+    const userContent = [];
+    userContent.push({ type: 'text', text: textContent.join('\n\n') });
+    imageBlocks.forEach(block => userContent.push(block));
 
     const client = new Anthropic({ apiKey });
     const response = await client.messages.create({
       model: 'claude-sonnet-4-20250514',
       max_tokens: 1024,
       system: systemPrompt,
-      messages: [{ role: 'user', content: userMessage }]
+      messages: [{ role: 'user', content: userContent }]
     });
 
     const text = response.content[0].text.trim();
@@ -94,7 +132,7 @@ ${categoryContext}
       const saved = addMemoryRecord({
         announcement_title,
         agency: agency || '한국수력원자력',
-        spec_text,
+        spec_text: spec_text || '',
         verdict: result.verdict,
         reasoning: result.reasoning,
         matched_category_id: matchedCategoryId,
@@ -107,7 +145,7 @@ ${categoryContext}
     const inserted = await pool.query(
       `INSERT INTO screening_records (announcement_title, agency, spec_text, verdict, reasoning, matched_category_id, confidence)
        VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
-      [announcement_title, agency || '한국수력원자력', spec_text, result.verdict, result.reasoning, matchedCategoryId, result.confidence]
+      [announcement_title, agency || '한국수력원자력', spec_text || '', result.verdict, result.reasoning, matchedCategoryId, result.confidence]
     );
 
     const { rows: savedRows } = await pool.query(
